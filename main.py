@@ -1,239 +1,233 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-import httpx
-import base64
-import json
-import sqlite3
-import os
+import httpx, base64, json, sqlite3, os, re
 from datetime import datetime
 from anthropic import Anthropic
 
 app = FastAPI()
-anthropic_client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 
-LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
-LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
-
-# ──────────────────────────────────────────
-# DATABASE
-# ──────────────────────────────────────────
 def init_db():
-    conn = sqlite3.connect("bp_records.db")
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
-            systolic INTEGER,
-            diastolic INTEGER,
-            pulse INTEGER,
-            raw_text TEXT,
-            advice TEXT,
-            created_at TEXT
-        )
-    """)
+    conn = sqlite3.connect("bp.db")
+    conn.execute("""CREATE TABLE IF NOT EXISTS records(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT, display_name TEXT,
+        sys INTEGER, dia INTEGER, pulse INTEGER,
+        level TEXT, advice TEXT, created_at TEXT)""")
     conn.commit()
     conn.close()
 
 init_db()
 
-def save_record(user_id, systolic, diastolic, pulse, raw_text, advice):
-    conn = sqlite3.connect("bp_records.db")
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO records (user_id, systolic, diastolic, pulse, raw_text, advice, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (user_id, systolic, diastolic, pulse, raw_text, advice, datetime.now().isoformat()))
+def save(user_id, name, sys, dia, pulse, level, advice):
+    conn = sqlite3.connect("bp.db")
+    conn.execute("INSERT INTO records VALUES(NULL,?,?,?,?,?,?,?,?)",
+        (user_id, name, sys, dia, pulse, level, advice,
+         datetime.now().strftime("%Y-%m-%d %H:%M")))
     conn.commit()
     conn.close()
 
-def get_history(user_id, limit=5):
-    conn = sqlite3.connect("bp_records.db")
-    c = conn.cursor()
-    c.execute("""
-        SELECT systolic, diastolic, pulse, created_at 
-        FROM records WHERE user_id=? ORDER BY created_at DESC LIMIT ?
-    """, (user_id, limit))
-    rows = c.fetchall()
+def history(user_id, n=5):
+    conn = sqlite3.connect("bp.db")
+    rows = conn.execute(
+        "SELECT sys,dia,pulse,level,created_at FROM records "
+        "WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+        (user_id, n)).fetchall()
     conn.close()
     return rows
 
-# ──────────────────────────────────────────
-# CLAUDE VISION — อ่านค่าความดันจากรูป
-# ──────────────────────────────────────────
-def analyze_bp_image(image_data: bytes, media_type: str) -> dict:
-    image_b64 = base64.standard_b64encode(image_data).decode("utf-8")
+def classify(sys, dia):
+    if sys >= 180 or dia >= 110:
+        return "red", "วิกฤต / Crisis"
+    if sys >= 140 or dia >= 90:
+        return "orange", "ป่วย / Stage 1-2 HTN"
+    if sys >= 130 or dia >= 80:
+        return "yellow", "เสี่ยง / Elevated"
+    return "green", "ปกติ / Normal"
 
-    response = anthropic_client.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=500,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": media_type,
-                        "data": image_b64
-                    }
-                },
-                {
-                    "type": "text",
-                    "text": """วิเคราะห์รูปเครื่องวัดความดันนี้ แล้วตอบกลับเป็น JSON เท่านั้น (ไม่มีข้อความอื่น):
-{
-  "systolic": <ค่าบน เช่น 120>,
-  "diastolic": <ค่าล่าง เช่น 80>,
-  "pulse": <ชีพจร หรือ null ถ้าไม่มี>,
-  "readable": <true/false ว่าอ่านค่าได้ชัดเจน>,
-  "note": "<หมายเหตุถ้ามี>"
+ADVICE = {
+    "green":  "✅ ความดันอยู่ในเกณฑ์ดีเยี่ยม รักษาพฤติกรรมสุขภาพที่ดีต่อไปนะครับ 💪",
+    "yellow": "⚠️ ความดันสูงกว่าปกติเล็กน้อย ควรลดเค็ม ออกกำลังกาย และติดตามสม่ำเสมอ",
+    "orange": "🔶 ความดันสูง ควรพบแพทย์ งดสูบบุหรี่ ลดความเครียด และรับประทานยาตามที่แพทย์สั่ง",
+    "red":    "🚨 อันตราย! ความดันสูงวิกฤต กรุณาพบแพทย์หรือโทร 1669 ทันที!",
 }
-ถ้าอ่านค่าไม่ได้ให้ใส่ readable: false และ systolic/diastolic เป็น null"""
-                }
-            ]
-        }]
-    )
 
-    text = response.content[0].text.strip()
-    # ล้าง markdown ถ้ามี
-    text = text.replace("```json", "").replace("```", "").strip()
+ICONS = {
+    "green": "🟢",
+    "yellow": "🟡",
+    "orange": "🟠",
+    "red": "🔴",
+}
+
+def parse_text(text):
+    nums = re.findall(r'\d+', text)
+    if len(nums) >= 2:
+        s, d = int(nums[0]), int(nums[1])
+        p = int(nums[2]) if len(nums) >= 3 else None
+        if 60 <= s <= 250 and 40 <= d <= 150:
+            return s, d, p
+    return None
+
+def read_image(img, mime):
+    b64 = base64.standard_b64encode(img).decode()
+    r = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=200,
+        messages=[{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}},
+            {"type": "text", "text": 'Read the blood pressure monitor. Reply JSON only:\n{"sys":120,"dia":80,"pulse":72,"ok":true}\nIf unreadable: {"ok":false}'}
+        ]}]
+    )
+    text = r.content[0].text.strip().replace("```json", "").replace("```", "")
     return json.loads(text)
 
-# ──────────────────────────────────────────
-# สร้างคำแนะนำสุขภาพ
-# ──────────────────────────────────────────
-def get_bp_advice(systolic: int, diastolic: int, pulse=None, history=None) -> str:
-    history_text = ""
-    if history:
-        history_text = "\n\nประวัติการวัดล่าสุด:\n"
-        for row in history:
-            history_text += f"- {row[0]}/{row[1]} mmHg, ชีพจร {row[2] or '-'} bpm ({row[3][:10]})\n"
+HEADERS = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
 
-    prompt = f"""ผู้ใช้วัดความดันได้:
-- ความดันตัวบน (Systolic): {systolic} mmHg
-- ความดันตัวล่าง (Diastolic): {diastolic} mmHg
-- ชีพจร: {pulse or 'ไม่ทราบ'} bpm
-{history_text}
+COLORS = {
+    "green":  {"bg": "#1a7a3c", "body": "#f0faf4"},
+    "yellow": {"bg": "#8a6d00", "body": "#fffdf0"},
+    "orange": {"bg": "#b54500", "body": "#fff8f3"},
+    "red":    {"bg": "#a01010", "body": "#fff5f5"},
+}
 
-กรุณา:
-1. บอกระดับความดัน (ปกติ/เฝ้าระวัง/สูง/สูงมาก)
-2. ให้คำแนะนำสั้นๆ ที่เป็นประโยชน์ (ไม่เกิน 3 ข้อ)
-3. บอกว่าควรพบแพทย์หรือไม่
+async def get_image(mid):
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
+            f"https://api-data.line.me/v2/bot/message/{mid}/content",
+            headers={"Authorization": f"Bearer {TOKEN}"}
+        )
+        return r.content, r.headers.get("content-type", "image/jpeg")
 
-ตอบภาษาไทย กระชับ เป็นมิตร ไม่เกิน 150 คำ"""
+async def get_profile(uid):
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"https://api.line.me/v2/bot/profile/{uid}", headers=HEADERS)
+        return r.json().get("displayName", "คุณ")
 
-    response = anthropic_client.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=300,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return response.content[0].text.strip()
-
-# ──────────────────────────────────────────
-# LINE API HELPERS
-# ──────────────────────────────────────────
-async def reply_message(reply_token: str, messages: list):
-    async with httpx.AsyncClient() as client:
-        await client.post(
+async def reply(token, messages):
+    async with httpx.AsyncClient() as c:
+        await c.post(
             "https://api.line.me/v2/bot/message/reply",
-            headers={
-                "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
-                "Content-Type": "application/json"
+            headers=HEADERS,
+            json={"replyToken": token, "messages": messages}
+        )
+
+def build_flex(name, sys, dia, pulse, level_key, level_label, advice, dt):
+    c = COLORS[level_key]
+    icon = ICONS[level_key]
+
+    pulse_row = []
+    if pulse is not None:
+        pulse_row = [{
+            "type": "box", "layout": "horizontal", "contents": [
+                {"type": "text", "text": "ชีพจร (Pulse)", "size": "xs", "color": "#888888", "flex": 3},
+                {"type": "text", "text": f"{pulse} bpm", "size": "sm", "weight": "bold", "color": "#1a1a1a", "align": "end", "flex": 2}
+            ]
+        }]
+
+    return {
+        "type": "flex",
+        "altText": f"ผลความดัน: {sys}/{dia} mmHg",
+        "contents": {
+            "type": "bubble",
+            "size": "kilo",
+            "header": {
+                "type": "box", "layout": "vertical",
+                "backgroundColor": c["bg"],
+                "paddingAll": "14px",
+                "contents": [
+                    {"type": "box", "layout": "horizontal", "contents": [
+                        {"type": "text", "text": "ผลการวัดความดัน", "size": "xs", "color": "#ffffff99", "weight": "bold", "flex": 1},
+                        {"type": "text", "text": icon, "size": "xl", "align": "end", "flex": 0}
+                    ]},
+                    {"type": "text", "text": level_label, "size": "lg", "weight": "bold", "color": "#ffffff", "margin": "sm"},
+                    {"type": "text", "text": f"คุณ{name}", "size": "xs", "color": "#ffffff88"}
+                ]
             },
-            json={"replyToken": reply_token, "messages": messages}
-        )
+            "body": {
+                "type": "box", "layout": "vertical",
+                "backgroundColor": c["body"],
+                "paddingAll": "14px", "spacing": "sm",
+                "contents": [
+                    {"type": "box", "layout": "horizontal", "contents": [
+                        {"type": "text", "text": "ความดันตัวบน (SYS)", "size": "xs", "color": "#888888", "flex": 3},
+                        {"type": "text", "text": f"{sys} mmHg", "size": "sm", "weight": "bold", "color": "#1a1a1a", "align": "end", "flex": 2}
+                    ]},
+                    {"type": "box", "layout": "horizontal", "contents": [
+                        {"type": "text", "text": "ความดันตัวล่าง (DIA)", "size": "xs", "color": "#888888", "flex": 3},
+                        {"type": "text", "text": f"{dia} mmHg", "size": "sm", "weight": "bold", "color": "#1a1a1a", "align": "end", "flex": 2}
+                    ]},
+                    *pulse_row,
+                    {"type": "separator", "margin": "md"},
+                    {"type": "text", "text": advice, "size": "xs", "color": "#333333", "wrap": True, "margin": "md"},
+                    {"type": "text", "text": f"📅 {dt}", "size": "xxs", "color": "#aaaaaa", "align": "end", "margin": "sm"}
+                ]
+            }
+        }
+    }
 
-async def get_line_image(message_id: str) -> tuple[bytes, str]:
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"https://api-data.line.me/v2/bot/message/{message_id}/content",
-            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
-        )
-        content_type = resp.headers.get("content-type", "image/jpeg")
-        return resp.content, content_type
-
-# ──────────────────────────────────────────
-# WEBHOOK ENDPOINT
-# ──────────────────────────────────────────
 @app.post("/webhook")
-async def webhook(request: Request):
-    body = await request.json()
-    events = body.get("events", [])
+async def webhook(req: Request):
+    body = await req.json()
+    for ev in body.get("events", []):
+        rt = ev.get("replyToken")
+        uid = ev.get("source", {}).get("userId", "")
+        msg = ev.get("message", {})
 
-    for event in events:
-        reply_token = event.get("replyToken")
-        user_id = event.get("source", {}).get("userId", "unknown")
-        event_type = event.get("type")
-        msg = event.get("message", {})
-
-        # รูปภาพ
-        if event_type == "message" and msg.get("type") == "image":
-            image_data, media_type = await get_line_image(msg["id"])
-
+        if ev["type"] == "message" and msg.get("type") == "image":
+            img, mime = await get_image(msg["id"])
             try:
-                result = analyze_bp_image(image_data, media_type)
-            except Exception as e:
-                await reply_message(reply_token, [{
-                    "type": "text",
-                    "text": "❌ ไม่สามารถวิเคราะห์รูปได้ กรุณาถ่ายรูปเครื่องวัดให้ชัดเจนและลองใหม่อีกครั้งนะครับ"
-                }])
+                res = read_image(img, mime)
+            except Exception:
+                await reply(rt, [{"type": "text", "text": "❌ ไม่สามารถวิเคราะห์รูปได้ ลองถ่ายให้เห็นหน้าจอชัดๆ แล้วส่งใหม่นะครับ"}])
                 continue
 
-            if not result.get("readable") or result.get("systolic") is None:
-                await reply_message(reply_token, [{
-                    "type": "text",
-                    "text": "🔍 อ่านค่าจากรูปไม่ได้ชัดเจน กรุณาถ่ายรูปให้เห็นหน้าจอเครื่องวัดชัดๆ แล้วส่งใหม่นะครับ"
-                }])
+            if not res.get("ok"):
+                await reply(rt, [{"type": "text", "text": "🔍 อ่านค่าจากรูปไม่ได้ กรุณาถ่ายให้เห็นตัวเลขชัดเจนครับ"}])
                 continue
 
-            systolic = result["systolic"]
-            diastolic = result["diastolic"]
-            pulse = result.get("pulse")
+            sys, dia, pulse = res["sys"], res["dia"], res.get("pulse")
+            name = await get_profile(uid)
+            level_key, level_label = classify(sys, dia)
+            advice = ADVICE[level_key]
+            dt = datetime.now().strftime("%d %b %Y · %H:%M")
+            save(uid, name, sys, dia, pulse, level_key, advice)
+            flex = build_flex(name, sys, dia, pulse, level_key, level_label, advice, dt)
+            await reply(rt, [flex])
 
-            history = get_history(user_id, limit=4)
-            advice = get_bp_advice(systolic, diastolic, pulse, history)
-            save_record(user_id, systolic, diastolic, pulse, json.dumps(result), advice)
+        elif ev["type"] == "message" and msg.get("type") == "text":
+            text = msg.get("text", "").strip()
+            parsed = parse_text(text)
 
-            pulse_text = f"\n💓 ชีพจร: {pulse} bpm" if pulse else ""
-            reply_text = (
-                f"📊 ผลการวัดความดัน\n"
-                f"━━━━━━━━━━━━\n"
-                f"🔴 ความดันตัวบน: {systolic} mmHg\n"
-                f"🔵 ความดันตัวล่าง: {diastolic} mmHg"
-                f"{pulse_text}\n"
-                f"━━━━━━━━━━━━\n\n"
-                f"{advice}"
-            )
+            if parsed:
+                sys, dia, pulse = parsed
+                name = await get_profile(uid)
+                level_key, level_label = classify(sys, dia)
+                advice = ADVICE[level_key]
+                dt = datetime.now().strftime("%d %b %Y · %H:%M")
+                save(uid, name, sys, dia, pulse, level_key, advice)
+                flex = build_flex(name, sys, dia, pulse, level_key, level_label, advice, dt)
+                await reply(rt, [flex])
 
-            await reply_message(reply_token, [{"type": "text", "text": reply_text}])
-
-        # ข้อความ "ประวัติ"
-        elif event_type == "message" and msg.get("type") == "text":
-            text = msg.get("text", "").strip().lower()
-
-            if "ประวัติ" in text or "history" in text:
-                rows = get_history(user_id, limit=5)
+            elif "ประวัติ" in text:
+                rows = history(uid)
                 if not rows:
-                    reply_text = "ยังไม่มีประวัติการวัดความดันครับ ลองส่งรูปผลวัดความดันมาได้เลย 📸"
+                    await reply(rt, [{"type": "text", "text": "ยังไม่มีประวัติครับ ลองส่งรูปหรือพิมพ์ค่าเช่น 120/80 ได้เลย 📸"}])
                 else:
-                    reply_text = "📋 ประวัติการวัดความดัน 5 ครั้งล่าสุด\n━━━━━━━━━━━━\n"
-                    for i, row in enumerate(rows, 1):
-                        reply_text += f"{i}. {row[0]}/{row[1]} mmHg"
-                        if row[2]:
-                            reply_text += f" 💓{row[2]}"
-                        reply_text += f"\n   📅 {row[3][:16]}\n"
-                await reply_message(reply_token, [{"type": "text", "text": reply_text}])
+                    txt = "📋 ประวัติ 5 ครั้งล่าสุด\n" + "-" * 22 + "\n"
+                    for s, d, p, lv, dt in rows:
+                        icon = ICONS.get(lv, "⚪")
+                        txt += f"{icon} {s}/{d} mmHg"
+                        if p:
+                            txt += f" 💓{p}"
+                        txt += f"\n   {dt}\n"
+                    await reply(rt, [{"type": "text", "text": txt}])
 
             else:
-                await reply_message(reply_token, [{
-                    "type": "text",
-                    "text": "👋 สวัสดีครับ! ส่งรูปผลวัดความดันมาได้เลย จะวิเคราะห์และให้คำแนะนำให้ครับ 📸\n\nพิมพ์ 'ประวัติ' เพื่อดูผลวัดย้อนหลัง"
-                }])
+                await reply(rt, [{"type": "text", "text": "👋 สวัสดีครับ! ส่งรูปเครื่องวัด หรือพิมพ์ค่าเช่น\n\n📝 120/80\n📝 120/80/72 (มีชีพจร)\n\nพิมพ์ 'ประวัติ' เพื่อดูผลย้อนหลัง"}])
 
-    return JSONResponse(content={"status": "ok"})
+    return JSONResponse({"status": "ok"})
 
 @app.get("/")
 def root():
-    return {"status": "BP Bot is running 🩺"}
-```
-
+    return {"status": "BP Bot running"}
