@@ -1,41 +1,13 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-import httpx, base64, json, sqlite3, os, re
+import httpx, base64, json, os, re
 from datetime import datetime
 from anthropic import Anthropic
 
 app = FastAPI()
 client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
-
-def init_db():
-    conn = sqlite3.connect("bp.db")
-    conn.execute("""CREATE TABLE IF NOT EXISTS records(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id TEXT, display_name TEXT,
-        sys INTEGER, dia INTEGER, pulse INTEGER,
-        level TEXT, advice TEXT, created_at TEXT)""")
-    conn.commit()
-    conn.close()
-
-init_db()
-
-def save(user_id, name, sys, dia, pulse, level, advice):
-    conn = sqlite3.connect("bp.db")
-    conn.execute("INSERT INTO records VALUES(NULL,?,?,?,?,?,?,?,?)",
-        (user_id, name, sys, dia, pulse, level, advice,
-         datetime.now().strftime("%Y-%m-%d %H:%M")))
-    conn.commit()
-    conn.close()
-
-def history(user_id, n=5):
-    conn = sqlite3.connect("bp.db")
-    rows = conn.execute(
-        "SELECT sys,dia,pulse,level,created_at FROM records "
-        "WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
-        (user_id, n)).fetchall()
-    conn.close()
-    return rows
+APPS_SCRIPT_URL = os.environ["APPS_SCRIPT_URL"]
 
 def classify(sys, dia):
     if sys >= 180 or dia >= 110:
@@ -60,6 +32,31 @@ ICONS = {
     "red": "🔴",
 }
 
+COLORS = {
+    "green":  {"bg": "#1a7a3c", "body": "#f0faf4"},
+    "yellow": {"bg": "#8a6d00", "body": "#fffdf0"},
+    "orange": {"bg": "#b54500", "body": "#fff8f3"},
+    "red":    {"bg": "#a01010", "body": "#fff5f5"},
+}
+
+async def save_to_sheet(user_id, name, sys, dia, pulse, level):
+    payload = {
+        "user_id": user_id,
+        "display_name": name,
+        "sys": sys,
+        "dia": dia,
+        "pulse": pulse,
+        "level": level,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M")
+    }
+    async with httpx.AsyncClient() as c:
+        await c.post(APPS_SCRIPT_URL, json=payload, follow_redirects=True)
+
+async def get_history(user_id):
+    async with httpx.AsyncClient() as c:
+        r = await c.get(APPS_SCRIPT_URL, params={"user_id": user_id}, follow_redirects=True)
+        return r.json()
+
 def parse_text(text):
     nums = re.findall(r'\d+', text)
     if len(nums) >= 2:
@@ -83,13 +80,6 @@ def read_image(img, mime):
     return json.loads(text)
 
 HEADERS = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
-
-COLORS = {
-    "green":  {"bg": "#1a7a3c", "body": "#f0faf4"},
-    "yellow": {"bg": "#8a6d00", "body": "#fffdf0"},
-    "orange": {"bg": "#b54500", "body": "#fff8f3"},
-    "red":    {"bg": "#a01010", "body": "#fff5f5"},
-}
 
 async def get_image(mid):
     async with httpx.AsyncClient() as c:
@@ -191,7 +181,7 @@ async def webhook(req: Request):
             level_key, level_label = classify(sys, dia)
             advice = ADVICE[level_key]
             dt = datetime.now().strftime("%d %b %Y · %H:%M")
-            save(uid, name, sys, dia, pulse, level_key, advice)
+            await save_to_sheet(uid, name, sys, dia, pulse, level_key)
             flex = build_flex(name, sys, dia, pulse, level_key, level_label, advice, dt)
             await reply(rt, [flex])
 
@@ -205,22 +195,26 @@ async def webhook(req: Request):
                 level_key, level_label = classify(sys, dia)
                 advice = ADVICE[level_key]
                 dt = datetime.now().strftime("%d %b %Y · %H:%M")
-                save(uid, name, sys, dia, pulse, level_key, advice)
+                await save_to_sheet(uid, name, sys, dia, pulse, level_key)
                 flex = build_flex(name, sys, dia, pulse, level_key, level_label, advice, dt)
                 await reply(rt, [flex])
 
             elif "ประวัติ" in text:
-                rows = history(uid)
+                try:
+                    rows = await get_history(uid)
+                except Exception:
+                    rows = []
+
                 if not rows:
                     await reply(rt, [{"type": "text", "text": "ยังไม่มีประวัติครับ ลองส่งรูปหรือพิมพ์ค่าเช่น 120/80 ได้เลย 📸"}])
                 else:
                     txt = "📋 ประวัติ 5 ครั้งล่าสุด\n" + "-" * 22 + "\n"
-                    for s, d, p, lv, dt in rows:
-                        icon = ICONS.get(lv, "⚪")
-                        txt += f"{icon} {s}/{d} mmHg"
-                        if p:
-                            txt += f" 💓{p}"
-                        txt += f"\n   {dt}\n"
+                    for r in rows:
+                        icon = ICONS.get(str(r.get("level")), "⚪")
+                        txt += f"{icon} {r.get('sys')}/{r.get('dia')} mmHg"
+                        if r.get("pulse"):
+                            txt += f" 💓{r.get('pulse')}"
+                        txt += f"\n   {r.get('created_at')}\n"
                     await reply(rt, [{"type": "text", "text": txt}])
 
             else:
